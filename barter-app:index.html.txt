@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Barter Market - Complete Edition</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { font-family: 'Inter', sans-serif; background-color: #f3f4f6; }
+        .theme-bg { background-color: #f59e0b; }
+        .theme-text { color: #f59e0b; }
+        .hide-scrollbar::-webkit-scrollbar { display: none; }
+        .chat-bubble-me { background-color: #f59e0b; color: white; border-radius: 1.2rem 1.2rem 0 1.2rem; }
+        .chat-bubble-other { background-color: #ffffff; color: #1f2937; border-radius: 1.2rem 1.2rem 1.2rem 0; border: 1px solid #e5e7eb; }
+        .view-transition { transition: all 0.3s ease-in-out; }
+    </style>
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, addDoc, setDoc, deleteDoc, onSnapshot, collection, query, where, arrayUnion, updateDoc, getDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        const firebaseConfig = JSON.parse(__firebase_config);
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let app, db, auth;
+        let userId = null;
+        let currentView = 'market';
+        let activeNegId = null;
+
+        async function init() {
+            app = initializeApp(firebaseConfig);
+            db = getFirestore(app);
+            auth = getAuth(app);
+            
+            if (initialAuthToken) {
+                await signInWithCustomToken(auth, initialAuthToken).catch(() => signInAnonymously(auth));
+            } else {
+                await signInAnonymously(auth);
+            }
+            
+            onAuthStateChanged(auth, async (user) => {
+                if (user) {
+                    userId = user.uid;
+                    document.getElementById('my-uid').textContent = userId;
+                    setupUserProfile();
+                    switchView('market');
+                }
+            });
+        }
+
+        // --- Profile Logic ---
+        async function setupUserProfile() {
+            const userRef = doc(db, 'artifacts', appId, 'users', userId, 'profile', 'info');
+            const snap = await getDoc(userRef);
+            if (!snap.exists()) {
+                await setDoc(userRef, { name: "ユーザー" + userId.substring(0,4), bio: "よろしくお願いします！", rating: 5.0 });
+            }
+        }
+
+        // --- View Control ---
+        window.switchView = function(view, data = null) {
+            currentView = view;
+            const views = ['market', 'negotiations', 'chat', 'profile'];
+            views.forEach(v => document.getElementById(`${v}-view`).classList.add('hidden'));
+            document.getElementById(`${view}-view`).classList.remove('hidden');
+            
+            if (view === 'market') loadItems();
+            if (view === 'negotiations') loadNegotiations();
+            if (view === 'chat' && data) initChat(data);
+            if (view === 'profile') loadProfile();
+        };
+
+        // --- Market Logic ---
+        function loadItems() {
+            const itemsRef = collection(db, 'artifacts', appId, 'public', 'data', 'items');
+            onSnapshot(itemsRef, (snap) => {
+                const list = document.getElementById('item-list');
+                list.innerHTML = '';
+                snap.forEach(d => {
+                    const item = d.data();
+                    if (item.status === 'completed') return;
+                    const card = document.createElement('div');
+                    card.className = "bg-white p-4 rounded-2xl shadow-sm mb-4";
+                    card.innerHTML = `
+                        <div class="flex space-x-4">
+                            <div class="w-20 h-20 rounded-lg flex-shrink-0 flex items-center justify-center text-white font-bold" style="background-color: ${stringToColor(item.title)}">
+                                ${item.title[0]}
+                            </div>
+                            <div class="flex-grow">
+                                <h3 class="font-bold text-lg">${item.title}</h3>
+                                <p class="text-xs text-gray-400 mb-1">出品者: ${item.ownerId.substring(0,8)}...</p>
+                                <p class="text-sm text-gray-600 line-clamp-2">${item.description}</p>
+                            </div>
+                        </div>
+                        <div class="mt-4 flex justify-between items-center">
+                            <span class="text-xs bg-orange-100 text-orange-600 px-2 py-1 rounded">${item.category}</span>
+                            ${item.ownerId === userId ? 
+                                `<button onclick="deleteItem('${d.id}')" class="text-red-400 text-sm">削除</button>` :
+                                `<button onclick="startTrade('${d.id}','${item.title}','${item.ownerId}')" class="bg-orange-500 text-white px-6 py-2 rounded-full font-bold shadow-lg">交換を申し込む</button>`
+                            }
+                        </div>
+                    `;
+                    list.appendChild(card);
+                });
+            });
+        }
+
+        window.addItem = async function() {
+            const title = document.getElementById('add-title').value;
+            const desc = document.getElementById('add-desc').value;
+            const cat = document.getElementById('add-cat').value;
+            if(!title || !desc) return alert("入力してください");
+            await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'items'), {
+                title, description: desc, category: cat, ownerId: userId, status: 'active', createdAt: new Date()
+            });
+            document.getElementById('add-title').value = '';
+            document.getElementById('add-desc').value = '';
+            alert("出品が完了しました！");
+        };
+
+        // --- Negotiation & Chat ---
+        window.startTrade = async function(itemId, title, sellerId) {
+            const negsRef = collection(db, 'artifacts', appId, 'public', 'data', 'negotiations');
+            const newNeg = await addDoc(negsRef, {
+                itemId, itemTitle: title, sellerId, buyerId: userId, status: 'active',
+                messages: [{ sender: 'system', text: "交渉が開始されました！", type: 'text' }]
+            });
+            switchView('chat', { id: newNeg.id, itemTitle: title, sellerId });
+        };
+
+        function loadNegotiations() {
+            const negsRef = collection(db, 'artifacts', appId, 'public', 'data', 'negotiations');
+            onSnapshot(negsRef, (snap) => {
+                const list = document.getElementById('neg-list');
+                list.innerHTML = '';
+                snap.forEach(d => {
+                    const n = d.data();
+                    if(n.sellerId !== userId && n.buyerId !== userId) return;
+                    const isSeller = n.sellerId === userId;
+                    const item = document.createElement('div');
+                    item.className = "bg-white p-4 rounded-xl shadow-sm mb-3 flex justify-between items-center cursor-pointer border-l-4 " + (n.status === 'completed' ? 'border-green-500' : 'border-orange-500');
+                    item.onclick = () => switchView('chat', { id: d.id, ...n });
+                    item.innerHTML = `
+                        <div>
+                            <p class="font-bold">${n.itemTitle}</p>
+                            <p class="text-xs text-gray-500">${isSeller ? '申し込みを受けました' : 'あなたが申し込み中'}</p>
+                        </div>
+                        <span class="text-xs ${n.status==='completed'?'text-green-500':'text-orange-500'} font-bold">
+                            ${n.status === 'completed' ? '取引完了' : '交渉中'}
+                        </span>
+                    `;
+                    list.appendChild(item);
+                });
+            });
+        }
+
+        let chatUnsub = null;
+        function initChat(neg) {
+            activeNegId = neg.id;
+            document.getElementById('chat-title').textContent = neg.itemTitle;
+            const completeBtn = document.getElementById('complete-btn');
+            
+            // 出品者のみ成約ボタンを表示
+            if (neg.sellerId === userId && neg.status !== 'completed') {
+                completeBtn.classList.remove('hidden');
+            } else {
+                completeBtn.classList.add('hidden');
+            }
+
+            if (chatUnsub) chatUnsub();
+            chatUnsub = onSnapshot(doc(db, 'artifacts', appId, 'public', 'data', 'negotiations', neg.id), (d) => {
+                if(d.exists()) renderMessages(d.data().messages);
+            });
+        }
+
+        function renderMessages(msgs) {
+            const container = document.getElementById('chat-box');
+            container.innerHTML = '';
+            msgs.forEach(m => {
+                const isMe = m.sender === userId;
+                const row = document.createElement('div');
+                row.className = `flex w-full mb-4 ${m.sender === 'system' ? 'justify-center' : (isMe ? 'justify-end' : 'justify-start')}`;
+                
+                if(m.sender === 'system') {
+                    row.innerHTML = `<span class="bg-gray-200 text-gray-500 text-[10px] px-3 py-1 rounded-full">${m.text}</span>`;
+                } else if(m.type === 'image') {
+                    row.innerHTML = `<div class="max-w-[70%] p-1 rounded-xl bg-white shadow-sm border border-gray-100">
+                        <div class="w-32 h-32 bg-gray-200 rounded flex items-center justify-center text-gray-400 text-[10px] text-center p-2">
+                            [${m.text}]<br>送信されました
+                        </div>
+                    </div>`;
+                } else {
+                    row.innerHTML = `<div class="p-3 max-w-[80%] shadow-sm text-sm ${isMe ? 'chat-bubble-me' : 'chat-bubble-other'}">${m.text}</div>`;
+                }
+                container.appendChild(row);
+            });
+            container.scrollTop = container.scrollHeight;
+        }
+
+        window.sendMsg = async function(type = 'text', customText = null) {
+            const input = document.getElementById('chat-input');
+            const text = customText || input.value.trim();
+            if(!text || !activeNegId) return;
+            const negRef = doc(db, 'artifacts', appId, 'public', 'data', 'negotiations', activeNegId);
+            await updateDoc(negRef, {
+                messages: arrayUnion({ sender: userId, text, type, time: new Date() })
+            });
+            if(type === 'text') input.value = '';
+        };
+
+        window.completeTrade = async function() {
+            if(!confirm("本当に交換を完了（成約）しますか？アイテムはマーケットから消えます。")) return;
+            const negRef = doc(db, 'artifacts', appId, 'public', 'data', 'negotiations', activeNegId);
+            const negSnap = await getDoc(negRef);
+            const negData = negSnap.data();
+            
+            // 1. 交渉ステータスを完了に
+            await updateDoc(negRef, { status: 'completed' });
+            // 2. アイテムステータスを完了に
+            await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'items', negData.itemId), { status: 'completed' });
+            // 3. システムメッセージ
+            await sendMsg('system', "取引が成立しました！おめでとうございます！");
+            alert("取引完了！");
+        };
+
+        // --- Helper ---
+        function stringToColor(str) {
+            let hash = 0;
+            for (let i = 0; i < str.length; i++) hash = str.charCodeAt(i) + ((hash << 5) - hash);
+            return `hsl(${hash % 360}, 60%, 50%)`;
+        }
+
+        window.onload = init;
+    </script>
+</head>
+<body class="flex justify-center min-h-screen">
+    <div class="w-full max-w-md bg-gray-50 shadow-2xl flex flex-col relative h-screen overflow-hidden">
+        
+        <!-- Header -->
+        <header class="theme-bg p-4 text-white flex justify-between items-center shadow-lg">
+            <h1 class="font-black italic text-lg tracking-tighter">BARTER PRO</h1>
+            <button onclick="switchView('profile')" class="bg-white/20 px-3 py-1 rounded text-[10px]">MY PAGE</button>
+        </header>
+
+        <!-- Main Content -->
+        <div class="flex-grow overflow-y-auto pb-24 hide-scrollbar">
+            
+            <!-- Market -->
+            <section id="market-view" class="p-4">
+                <div class="bg-white p-5 rounded-3xl shadow-sm mb-6">
+                    <h2 class="font-bold text-gray-800 mb-4">新規出品</h2>
+                    <input id="add-title" type="text" placeholder="アイテム名" class="w-full p-3 bg-gray-100 rounded-xl mb-3 outline-none focus:ring-2 ring-orange-400">
+                    <select id="add-cat" class="w-full p-3 bg-gray-100 rounded-xl mb-3 outline-none">
+                        <option>本・雑誌</option>
+                        <option>ガジェット</option>
+                        <option>ファッション</option>
+                        <option>その他</option>
+                    </select>
+                    <textarea id="add-desc" placeholder="詳細、交換条件など..." class="w-full p-3 bg-gray-100 rounded-xl h-20 outline-none focus:ring-2 ring-orange-400 mb-3"></textarea>
+                    <button onclick="addItem()" class="w-full theme-bg text-white py-3 rounded-2xl font-bold shadow-md">出品する</button>
+                </div>
+                <h2 class="font-bold text-gray-800 mb-3 ml-1 text-lg">新着アイテム</h2>
+                <div id="item-list"></div>
+            </section>
+
+            <!-- Negotiations -->
+            <section id="negotiations-view" class="hidden p-4">
+                <h2 class="font-bold text-xl mb-6">取引・交渉一覧</h2>
+                <div id="neg-list"></div>
+            </section>
+
+            <!-- Chat -->
+            <section id="chat-view" class="hidden fixed inset-0 bg-gray-100 z-50 flex flex-col">
+                <div class="bg-white p-4 border-b flex justify-between items-center shadow-sm">
+                    <div class="flex items-center">
+                        <button onclick="switchView('negotiations')" class="mr-3 text-xl">←</button>
+                        <h2 id="chat-title" class="font-bold">アイテム名</h2>
+                    </div>
+                    <button id="complete-btn" onclick="completeTrade()" class="hidden bg-green-500 text-white px-4 py-1.5 rounded-full text-xs font-bold">取引成立させる</button>
+                </div>
+                <div id="chat-box" class="flex-grow overflow-y-auto p-4 flex flex-col"></div>
+                <div class="p-4 bg-white border-t flex flex-col space-y-2">
+                    <div class="flex space-x-2 overflow-x-auto pb-2">
+                        <button onclick="sendMsg('image', '商品写真')" class="bg-gray-100 text-[10px] px-3 py-1 rounded-full flex-shrink-0">📷 写真を送る</button>
+                        <button onclick="sendMsg('text', 'まだありますか？')" class="bg-gray-100 text-[10px] px-3 py-1 rounded-full flex-shrink-0">まだありますか？</button>
+                        <button onclick="sendMsg('text', 'どこで交換しますか？')" class="bg-gray-100 text-[10px] px-3 py-1 rounded-full flex-shrink-0">どこで交換？</button>
+                    </div>
+                    <div class="flex space-x-2">
+                        <input id="chat-input" type="text" placeholder="メッセージ..." class="flex-grow bg-gray-100 p-3 rounded-2xl outline-none focus:ring-1 ring-orange-400">
+                        <button onclick="sendMsg()" class="theme-bg text-white w-12 h-12 rounded-full flex items-center justify-center font-bold">↑</button>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Profile -->
+            <section id="profile-view" class="hidden p-6 text-center">
+                <div class="w-24 h-24 theme-bg rounded-full mx-auto mb-4 flex items-center justify-center text-white text-3xl font-bold">ME</div>
+                <h2 class="text-xl font-bold">マイプロフィール</h2>
+                <p id="my-uid" class="text-[10px] text-gray-400 font-mono mb-4"></p>
+                <div class="bg-white p-6 rounded-3xl shadow-sm text-left">
+                    <p class="text-xs text-gray-400 uppercase font-bold mb-1">取引評価</p>
+                    <p class="text-2xl font-black text-yellow-500 mb-4">★ 5.0 <span class="text-sm text-gray-400 font-normal">(新規ユーザー)</span></p>
+                    <p class="text-xs text-gray-400 uppercase font-bold mb-1">自己紹介</p>
+                    <p class="text-sm text-gray-600">現在、物々交換アプリのプロトタイプをテスト中です！</p>
+                </div>
+                <button onclick="switchView('market')" class="mt-8 text-gray-400 text-sm">← マーケットに戻る</button>
+            </section>
+
+        </div>
+
+        <!-- Tab Bar -->
+        <nav class="absolute bottom-0 w-full bg-white border-t border-gray-100 flex justify-around p-3 pb-6 shadow-2xl">
+            <button onclick="switchView('market')" class="flex flex-col items-center opacity-60 hover:opacity-100">
+                <span class="text-xl">🏠</span>
+                <span class="text-[9px] font-bold mt-1">HOME</span>
+            </button>
+            <button onclick="switchView('negotiations')" class="flex flex-col items-center opacity-60 hover:opacity-100">
+                <span class="text-xl">💬</span>
+                <span class="text-[9px] font-bold mt-1">CHAT</span>
+            </button>
+            <button onclick="switchView('profile')" class="flex flex-col items-center opacity-60 hover:opacity-100">
+                <span class="text-xl">👤</span>
+                <span class="text-[9px] font-bold mt-1">USER</span>
+            </button>
+        </nav>
+    </div>
+</body>
+</html>
+
